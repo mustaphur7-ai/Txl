@@ -1,2 +1,1 @@
-yfinance
-pandas
+# Standard library only. No packages needed.

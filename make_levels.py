@@ -1,188 +1,158 @@
-"""Daily XAUUSD levels from the GLD options chain (open interest, Greeks, volatility)."""
+"""Daily BTC options analysis. Writes levels.json only on success."""
 import json, math, os, sys, time, urllib.request
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
-import yfinance as yf
+from datetime import datetime, timezone, timedelta
 
+DERIBIT = "https://www.deribit.com/api/v2/public/"
 RATE = 0.04
-MAX_DAYS = 30
-MIN_GAP = 0.0015
-OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "levels.json")
 
-
-def retry(fn, tries=3, wait=5):
-    last = None
-    for i in range(tries):
+def get(url):
+    for attempt in range(3):
         try:
-            return fn()
-        except Exception as e:
-            last = e
-            print(f"attempt {i + 1} failed: {e}", file=sys.stderr)
-            time.sleep(wait)
-    raise last
+            req = urllib.request.Request(url, headers={"User-Agent": "btc-levels"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.load(r)
+        except Exception:
+            if attempt == 2:
+                raise
+            time.sleep(3 * (attempt + 1))
 
-
-def http_json(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=15) as r:
-        return json.load(r)
-
-
-def xau_spot():
-    for url in ("https://fapi.binance.com/fapi/v1/ticker/price?symbol=XAUUSDT",
-                "https://data-api.binance.vision/api/v3/ticker/price?symbol=PAXGUSDT"):
+def spot_price():
+    sources = [
+        ("deribit", DERIBIT + "get_index_price?index_name=btc_usd", lambda d: d["result"]["index_price"]),
+        ("binance", "https://data-api.binance.vision/api/v3/ticker/price?symbol=BTCUSDT", lambda d: d["price"]),
+        ("coinbase", "https://api.coinbase.com/v2/prices/BTC-USD/spot", lambda d: d["data"]["amount"]),
+    ]
+    for name, url, pick in sources:
         try:
-            return float(http_json(url)["price"]), url.split("symbol=")[1]
+            value = float(pick(get(url)))
+            if value > 0:
+                return value, name
         except Exception as e:
-            print(f"spot source failed: {e}", file=sys.stderr)
-    return float(yf.Ticker("GC=F").history(period="5d")["Close"].iloc[-1]), "GC=F"
+            print(f"{name} failed: {e}", file=sys.stderr)
+    raise RuntimeError("no spot source available")
 
+def greeks(s, k, t, v, call):
+    d1 = (math.log(s / k) + (RATE + v * v / 2) * t) / (v * math.sqrt(t))
+    pdf = math.exp(-d1 * d1 / 2) / math.sqrt(2 * math.pi)
+    cdf = (1 + math.erf(d1 / math.sqrt(2))) / 2
+    return (cdf if call else cdf - 1, pdf / (s * v * math.sqrt(t)), s * pdf * math.sqrt(t) / 100)
 
-def load_chain():
-    t = yf.Ticker("GLD")
-    gld = float(t.history(period="5d")["Close"].iloc[-1])
-    today = datetime.now(timezone.utc).date()
-    opts = []
-    for exp in t.options:
-        days = (datetime.strptime(exp, "%Y-%m-%d").date() - today).days
-        if days < 0 or days > MAX_DAYS:
+def load_options(now):
+    ins = get(DERIBIT + "get_instruments?currency=BTC&kind=option&expired=false")["result"]
+    book = get(DERIBIT + "get_book_summary_by_currency?currency=BTC&kind=option")["result"]
+    meta = {i["instrument_name"]: i for i in ins}
+    rows = []
+    for b in book:
+        m = meta.get(b["instrument_name"])
+        oi, iv = b.get("open_interest") or 0, b.get("mark_iv") or 0
+        if not m or oi <= 0 or iv <= 0:
             continue
-        T = max(days, 0.5) / 365
-        ch = t.option_chain(exp)
-        for kind, df in (("C", ch.calls), ("P", ch.puts)):
-            for r in df.itertuples():
-                oi, iv, bid, ask = r.openInterest, r.impliedVolatility, r.bid, r.ask
-                if oi > 0 and iv > 0.01 and bid > 0 and ask > 0:  # NaN fails these checks
-                    opts.append(dict(k=float(r.strike), kind=kind, oi=float(oi), iv=float(iv), T=T, days=days))
-    if not opts:
-        raise RuntimeError("no usable options rows")
-    return gld, opts
+        secs = m["expiration_timestamp"] / 1000 - now.timestamp()
+        if 0 < secs <= 30 * 86400:
+            rows.append({"k": float(m["strike"]), "call": m["option_type"] == "call", "oi": oi,
+                         "iv": iv / 100, "t": max(secs / 86400, 0.5) / 365})
+    if len(rows) < 20:
+        raise RuntimeError(f"only {len(rows)} usable options")
+    return rows
 
+def total_gex(rows, s):
+    return sum((1 if r["call"] else -1) * greeks(s, r["k"], r["t"], r["iv"], r["call"])[1]
+               * r["oi"] * s * s * 0.01 for r in rows)
 
-def npdf(x): return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
-def ncdf(x): return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+def gamma_flip(rows, spot):
+    grid = [spot * (0.9 + 0.001 * i) for i in range(201)]
+    vals = [total_gex(rows, s) for s in grid]
+    cross = [a - va * (b - a) / (vb - va)
+             for a, b, va, vb in zip(grid, grid[1:], vals, vals[1:]) if va * vb < 0]
+    if cross:
+        return min(cross, key=lambda x: abs(x - spot))
+    return min(zip(grid, vals), key=lambda p: abs(p[1]))[0]
 
+def by_strike(rows, spot):
+    out = {}
+    for r in rows:
+        x = out.setdefault(r["k"], dict(strike=r["k"], call_oi=0, put_oi=0, call_gex=0, put_gex=0,
+                                        net_delta=0, vega=0, ivs=[]))
+        d, g, v = greeks(spot, r["k"], r["t"], r["iv"], r["call"])
+        side = "call" if r["call"] else "put"
+        x[side + "_oi"] += r["oi"]
+        x[side + "_gex"] += (1 if r["call"] else -1) * g * r["oi"] * spot * spot * 0.01
+        x["net_delta"] += d * r["oi"]
+        x["vega"] += v * r["oi"]
+        x["ivs"].append(r["iv"])
+    for x in out.values():
+        x["iv"] = sum(x["ivs"]) / len(x.pop("ivs"))
+        x["gex"] = x["call_gex"] + x["put_gex"]
+    return out
 
-def greeks(S, K, T, iv, kind):
-    sq = iv * math.sqrt(T)
-    d1 = (math.log(S / K) + (RATE + 0.5 * iv * iv) * T) / sq
-    delta = ncdf(d1) if kind == "C" else ncdf(d1) - 1
-    gamma = npdf(d1) / (S * sq)
-    vega = S * npdf(d1) * math.sqrt(T) / 100
-    return delta, gamma, vega
-
+def pick_levels(strikes, spot, move, atm, keys, above):
+    side = "call" if above else "put"
+    on_side = lambda p: p > spot if above else p < spot
+    bounds = [spot + n * move for n in (-2, -1, 1, 2)]
+    prices = {k for k in strikes if abs(k / spot - 1) <= 0.08} | set(bounds)
+    cands = []
+    for p in filter(on_side, prices):
+        x = strikes[min(strikes, key=lambda k: abs(k - p))]  # nearest strike's data
+        cands.append(dict(price=p, oi=x[side + "_oi"], gex=x[side + "_gex"],
+                          delta=abs(x["net_delta"]), vega=x["vega"], skew=abs(x["iv"] - atm)))
+    if not cands:
+        raise RuntimeError("no candidates")
+    top = {f: max(abs(c[f]) for c in cands) or 1 for f in ("oi", "gex", "delta", "vega", "skew")}
+    for c in cands:
+        n = {f: abs(c[f]) / top[f] for f in top}
+        near_em = max(0, 1 - min(abs(c["price"] - b) for b in bounds) / move)
+        near_key = max(0, 1 - min(abs(c["price"] - k) for k in keys) / (spot * 0.08))
+        c["score"] = (35 * n["oi"] + 25 * n["gex"] + 15 * (n["delta"] + n["vega"]) / 2
+                      + 15 * (n["skew"] + near_em) / 2 + 10 * near_key)
+    chosen = []
+    for c in sorted(cands, key=lambda c: -c["score"]):
+        if all(abs(c["price"] - o["price"]) >= spot * 0.003 for o in chosen):
+            chosen.append(c)
+        if len(chosen) == 3:
+            break
+    if len(chosen) < 3:
+        raise RuntimeError("fewer than 3 levels on one side")
+    chosen.sort(key=lambda c: abs(c["price"] - spot))
+    return [dict(price=round(c["price"], 2), score=round(c["score"], 1),
+                 open_interest=round(c["oi"], 1), gex=round(c["gex"])) for c in chosen]
 
 def main():
-    gld, opts = retry(load_chain)
-    xau, src = retry(xau_spot)
-    ratio = xau / gld
-
-    strikes = {}
-    for o in opts:
-        dl, g, v = greeks(gld, o["k"], o["T"], o["iv"], o["kind"])
-        s = strikes.setdefault(o["k"], dict(call_oi=0, put_oi=0, call_gex=0, put_gex=0, call_delta=0,
-                                            put_delta=0, call_vega=0, put_vega=0, ivs=[]))
-        gex = g * o["oi"] * 100 * gld * gld * 0.01
-        s["ivs"].append(o["iv"])
-        if o["kind"] == "C":
-            s["call_oi"] += o["oi"]; s["call_gex"] += gex
-            s["call_delta"] += dl * o["oi"] * 100; s["call_vega"] += v * o["oi"] * 100
-        else:
-            s["put_oi"] += o["oi"]; s["put_gex"] -= gex
-            s["put_delta"] += dl * o["oi"] * 100; s["put_vega"] += v * o["oi"] * 100
-
-    # ATM implied volatility and expected daily move
-    near = min(o["days"] for o in opts)
-    pool = [o for o in opts if o["days"] == near]
-    atm_k = min((o["k"] for o in pool), key=lambda k: abs(k - gld))
-    atm_ivs = [o["iv"] for o in pool if o["k"] == atm_k]
-    atm_iv = sum(atm_ivs) / len(atm_ivs)
-    em = xau * atm_iv * math.sqrt(1 / 252)
-
-    # Walls
-    up = [k for k in strikes if k > gld] or list(strikes)
-    dn = [k for k in strikes if k < gld] or list(strikes)
-    ck = max(up, key=lambda k: strikes[k]["call_gex"])
-    pk = max(dn, key=lambda k: abs(strikes[k]["put_gex"]))
-    call_wall = dict(price=round(ck * ratio, 2), open_interest=int(strikes[ck]["call_oi"]), gex=round(strikes[ck]["call_gex"]))
-    put_wall = dict(price=round(pk * ratio, 2), open_interest=int(strikes[pk]["put_oi"]), gex=round(strikes[pk]["put_gex"]))
-
-    # Gamma flip: zero crossing of total GEX over a +/-5% spot grid
-    def total(P):
-        t = 0.0
-        for o in opts:
-            _, g, _ = greeks(P, o["k"], o["T"], o["iv"], o["kind"])
-            x = g * o["oi"] * 100 * P * P * 0.01
-            t += x if o["kind"] == "C" else -x
-        return t
-    grid = [gld * (0.95 + 0.0025 * i) for i in range(41)]
-    vals = [total(p) for p in grid]
-    cross = []
-    for i in range(40):
-        a, b = vals[i], vals[i + 1]
-        if a == 0:
-            cross.append(grid[i])
-        elif a * b < 0:
-            cross.append(grid[i] + (grid[i + 1] - grid[i]) * (-a / (b - a)))
-    flip_g = min(cross, key=lambda p: abs(p - gld)) if cross else grid[min(range(41), key=lambda i: abs(vals[i]))]
-    gamma_flip = round(flip_g * ratio, 2)
-    anchors = [call_wall["price"], put_wall["price"], gamma_flip]
-
-    def pick(side):
-        sign = 1 if side == "R" else -1
-        pre = "call" if side == "R" else "put"
-        c = []
-        for k, s in strikes.items():
-            p = k * ratio
-            if not (xau < p <= xau * 1.04 if side == "R" else xau * 0.96 <= p < xau):
-                continue
-            c.append(dict(price=p, oi=s[pre + "_oi"], gex=abs(s[pre + "_gex"]), dl=abs(s[pre + "_delta"]),
-                          vg=s[pre + "_vega"], iv=sum(s["ivs"]) / len(s["ivs"])))
-        for n in (1, 2):
-            c.append(dict(price=xau + sign * n * em, oi=0, gex=0, dl=0, vg=0, iv=atm_iv))
-        mx = lambda key: max(x[key] for x in c) or 1
-        mo, mg, md, mv = mx("oi"), mx("gex"), mx("dl"), mx("vg")
-        ms = max(abs(x["iv"] - atm_iv) / atm_iv for x in c) or 1
-        for x in c:
-            skew = abs(x["iv"] - atm_iv) / atm_iv / ms
-            emc = max(0, 1 - min(abs(x["price"] - (xau + sign * n * em)) for n in (1, 2)) / em)
-            prox = max(0, 1 - min(abs(x["price"] - a) for a in anchors) / (2 * em))
-            x["score"] = 100 * (0.35 * x["oi"] / mo + 0.25 * x["gex"] / mg
-                                + 0.15 * (0.5 * x["dl"] / md + 0.5 * x["vg"] / mv)
-                                + 0.15 * (0.5 * skew + 0.5 * emc) + 0.10 * prox)
-        chosen = []
-        for x in sorted(c, key=lambda x: -x["score"]):
-            if all(abs(x["price"] - y["price"]) / x["price"] >= MIN_GAP for y in chosen):
-                chosen.append(x)
-            if len(chosen) == 3:
-                break
-        chosen.sort(key=lambda x: abs(x["price"] - xau))
-        return [dict(price=round(x["price"], 2), score=round(x["score"], 1),
-                     open_interest=int(x["oi"]), gex=round(x["gex"])) for x in chosen]
-
-    top = sorted(strikes.items(), key=lambda kv: -abs(kv[1]["call_gex"] + kv[1]["put_gex"]))[:10]
     now = datetime.now(timezone.utc)
-    out = dict(
-        sample=False,
-        analyzed_at=now.astimezone(ZoneInfo("Africa/Nairobi")).isoformat(timespec="seconds"),
-        analyzed_at_utc=now.isoformat(timespec="seconds"),
-        spot_source=src, gld_ratio=round(ratio, 4), gld_spot=round(gld, 2),
-        xauusd_spot_at_analysis=round(xau, 2), atm_iv=round(atm_iv, 4), expected_move_1sd=round(em, 2),
-        call_wall=call_wall, put_wall=put_wall, gamma_flip=gamma_flip,
-        resistances=pick("R"), supports=pick("S"),
-        top_gex_strikes=[dict(price=round(k * ratio, 2), net_gex=round(s["call_gex"] + s["put_gex"]),
-                              call_oi=int(s["call_oi"]), put_oi=int(s["put_oi"])) for k, s in top],
-    )
-    tmp = OUT + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(out, f, indent=2)
-    os.replace(tmp, OUT)  # only reached on success, so old levels survive a failed run
-    print("levels written", out["analyzed_at"])
+    spot, source = spot_price()
+    rows = load_options(now)
+    strikes = by_strike(rows, spot)
+    first = min((r["t"] for r in rows if r["t"] >= 1 / 365), default=min(r["t"] for r in rows))
+    near = [r for r in rows if r["t"] == first]
+    atm_k = min((r["k"] for r in near), key=lambda k: abs(k - spot))
+    ivs = [r["iv"] for r in near if r["k"] == atm_k]
+    atm = sum(ivs) / len(ivs)
+    move = spot * atm * math.sqrt(1 / 365)
 
+    def wall(side, cands):
+        cands = [x for x in cands if abs(x[side + "_gex"]) > 0]
+        x = max(cands, key=lambda x: abs(x[side + "_gex"]))
+        return dict(price=x["strike"], open_interest=round(x[side + "_oi"], 1), gex=round(x[side + "_gex"]))
+
+    cw = wall("call", [x for k, x in strikes.items() if k > spot])
+    pw = wall("put", [x for k, x in strikes.items() if k < spot])
+    flip = round(gamma_flip(rows, spot), 2)
+    keys = [cw["price"], pw["price"], flip]
+    top = sorted(strikes.values(), key=lambda x: -abs(x["gex"]))[:10]
+    data = dict(
+        sample=False,
+        analyzed_at=now.astimezone(timezone(timedelta(hours=3))).isoformat(timespec="seconds"),
+        analyzed_at_utc=now.isoformat(timespec="seconds"),
+        spot_source=source, spot_at_analysis=round(spot, 2),
+        atm_iv=round(atm, 4), expected_move_1sd=round(move, 2),
+        call_wall=cw, put_wall=pw, gamma_flip=flip,
+        resistances=pick_levels(strikes, spot, move, atm, keys, True),
+        supports=pick_levels(strikes, spot, move, atm, keys, False),
+        top_gex_strikes=[{k: round(v, 4) for k, v in x.items()} for x in top],
+    )
+    with open("levels.json.tmp", "w") as f:
+        json.dump(data, f, indent=2, allow_nan=False)
+    os.replace("levels.json.tmp", "levels.json")
+    print("levels.json written, spot", data["spot_at_analysis"])
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"analysis failed, keeping previous levels: {e}", file=sys.stderr)
-        sys.exit(1)
+    main()
