@@ -25,6 +25,18 @@
     <div><span class="muted">Next analysis in</span><b id="countdown">--</b></div>
   </section>
 
+  <section class="chart-section">
+    <div class="chart-head">
+      <div id="tfBar" class="tfbar"></div>
+      <span id="chartInfo" class="muted small"></span>
+    </div>
+    <div id="chartWrap" class="chart-wrap">
+      <canvas id="chart"></canvas>
+      <div id="chartMsg" class="chart-msg">Loading chart</div>
+      <button id="jumpNow" class="jump" type="button" hidden>Jump to now</button>
+    </div>
+  </section>
+
   <section>
     <h2>Levels</h2>
     <p class="muted small">Frozen until the next analysis. Only the price and distances update live.</p>
@@ -33,6 +45,7 @@
 
   <p class="disclaimer">Information only, not financial advice. Levels are estimates from delayed GLD options data.</p>
 </main>
+<script src="chart.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

@@ -17,6 +17,7 @@ async function loadLevels() {
     if (L.sample) { b.hidden = false; b.textContent = "Sample data. Run the workflow once to load real levels."; }
     else if (age > 26) { b.hidden = false; b.textContent = "Stale data: the last analysis was " + Math.round(age) + " hours ago."; }
     else b.hidden = true;
+    if (window.XChart) XChart.setLevels(L);
     render();
   } catch (e) {
     $("banner").hidden = false;
@@ -76,6 +77,7 @@ async function pollSpot() {
       if (!r.ok) continue;
       spot = parseFloat((await r.json()).price);
       $("price").textContent = fmt(spot);
+      if (window.XChart) XChart.setPrice(spot);
       $("dot").className = "dot ok";
       $("priceMeta").textContent = name + " " + new Date().toLocaleTimeString("en-GB", { timeZone: "Africa/Nairobi" });
       render();
