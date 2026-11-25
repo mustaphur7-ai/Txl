@@ -7,7 +7,7 @@
     PAXGUSDT: "https://api.binance.com/api/v3/klines?symbol=PAXGUSDT"
   };
   const S = { tf: "5m", candles: [], levels: [], price: null, symbol: "XAUUSDT", offset: 0, vis: 80,
-              cross: null, err: false, loading: true, token: 0 };
+              cross: null, err: false, loading: true, token: 0, sig: [] };
   const wrap = document.getElementById("chartWrap");
   const cv = document.getElementById("chart");
   const ctx = cv.getContext("2d");
@@ -89,7 +89,8 @@
     let lo = Infinity, hi = -Infinity;
     for (let i = i0; i <= i1; i++) { lo = Math.min(lo, S.candles[i].l); hi = Math.max(hi, S.candles[i].h); }
     const ref = S.price || S.candles[n - 1].c;
-    for (const L of S.levels) if (Math.abs(L.price - ref) / ref <= 0.03) { lo = Math.min(lo, L.price); hi = Math.max(hi, L.price); }
+    const all = S.levels.concat(S.sig);
+    for (const L of all) if (Math.abs(L.price - ref) / ref <= 0.03) { lo = Math.min(lo, L.price); hi = Math.max(hi, L.price); }
     const pad = (hi - lo) * 0.05 || 1; lo -= pad; hi += pad;
     const y = (p) => padT + ((hi - p) / (hi - lo)) * plotH;
     const x = (i) => padL + (i - start + 0.5) * cw;
@@ -120,9 +121,9 @@
     }
 
     // level lines
-    const vis = S.levels.filter((L) => L.price >= lo && L.price <= hi).sort((a, b) => b.price - a.price);
+    const vis = all.filter((L) => L.price >= lo && L.price <= hi).sort((a, b) => b.price - a.price);
     for (const L of vis) {
-      ctx.strokeStyle = L.color; ctx.lineWidth = 1; ctx.setLineDash(L.dash ? [6, 4] : []);
+      ctx.strokeStyle = L.color; ctx.lineWidth = 1; ctx.setLineDash(L.dash === "dot" ? [2, 3] : L.dash ? [6, 4] : []);
       const yy = Math.round(y(L.price)) + 0.5;
       ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(W - padR, yy); ctx.stroke();
     }
@@ -267,6 +268,14 @@
   // ---------- public API used by app.js ----------
   window.XChart = {
     setPrice(p) { S.price = p; draw(); },
+    setSignal(g) {
+      S.sig = g ? [
+        { label: "Entry", price: g.entry, color: C.white, dash: false },
+        { label: "SL", price: g.sl, color: C.down, dash: "dot" },
+        { label: "TP1", price: g.tp1, color: C.up, dash: "dot" }
+      ].concat(g.tp2 ? [{ label: "TP2", price: g.tp2, color: C.up, dash: "dot" }] : []) : [];
+      draw();
+    },
     setLevels(L) {
       const R = C.down, G = C.up, A = C.amber, lv = [];
       lv.push({ label: "Call wall", price: L.call_wall.price, color: R, dash: false });

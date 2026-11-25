@@ -18,6 +18,7 @@ async function loadLevels() {
     else if (age > 26) { b.hidden = false; b.textContent = "Stale data: the last analysis was " + Math.round(age) + " hours ago."; }
     else b.hidden = true;
     if (window.XChart) XChart.setLevels(L);
+    if (window.XAlerts) XAlerts.setLevels(L);
     render();
   } catch (e) {
     $("banner").hidden = false;
@@ -78,6 +79,7 @@ async function pollSpot() {
       spot = parseFloat((await r.json()).price);
       $("price").textContent = fmt(spot);
       if (window.XChart) XChart.setPrice(spot);
+      if (window.XAlerts) XAlerts.setPrice(spot);
       $("dot").className = "dot ok";
       $("priceMeta").textContent = name + " " + new Date().toLocaleTimeString("en-GB", { timeZone: "Africa/Nairobi" });
       render();
