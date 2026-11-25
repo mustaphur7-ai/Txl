@@ -94,3 +94,19 @@ loadLevels(); pollSpot(); tick();
 setInterval(pollSpot, 5000);
 setInterval(tick, 1000);
 setInterval(loadLevels, 600000);
+
+// ---------- tabs ----------
+function showTab(name) {
+  const chart = name === "chart";
+  $("paneMain").hidden = chart;
+  $("paneChart").hidden = !chart;
+  $("tabMain").classList.toggle("on", !chart);
+  $("tabChart").classList.toggle("on", chart);
+  document.body.classList.toggle("chart-tab", chart);
+  try { history.replaceState(null, "", chart ? "#chart" : location.pathname + location.search); } catch (e) {}
+  window.scrollTo(0, 0);
+  setTimeout(() => window.dispatchEvent(new Event("resize")), 30);
+}
+$("tabMain").addEventListener("click", () => showTab("main"));
+$("tabChart").addEventListener("click", () => showTab("chart"));
+if (location.hash === "#chart") showTab("chart");

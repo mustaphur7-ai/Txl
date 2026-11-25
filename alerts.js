@@ -285,6 +285,9 @@
       ["sigEntry", "sigSl", "sigTp1", "sigTp2", "sigRr"].forEach((i) => { $(i).textContent = "--"; });
       $("sigMeta").textContent = "";
     }
+    $("chartSig").textContent = sig && sig.status === "Active"
+      ? sig.side + " " + fp(sig.entry) + "  |  SL " + fp(sig.sl) + "  |  TP1 " + fp(sig.tp1)
+      : "No active signal";
   }
 
   function buildChecks() {
